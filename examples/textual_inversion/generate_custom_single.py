@@ -8,7 +8,7 @@ import random
 from tqdm import tqdm
 
 model_id = "CompVis/stable-diffusion-v1-4"
-model_path = "./textual_inversion_root_init/"
+model_path = "./textual_inversion_imr_test/"
 
 target_path = './generated_images/new.jpg'
 

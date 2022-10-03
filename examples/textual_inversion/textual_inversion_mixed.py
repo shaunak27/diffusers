@@ -364,12 +364,7 @@ def main():
     # Convert the initializer_token, placeholder_token to ids
     initializer_token_list = [mapper[p[1:-2]] for p in placeholder_token_list]
     token_ids = [tokenizer.encode(it, add_special_tokens=False) for it in initializer_token_list]
-    #dog_id = 49111 #tokenizer.encode('<n02279972*>', add_special_tokens=False)[0]
-    # Check if initializer_token is a single token or a sequence of tokens
-    # if len(token_ids) > 1:
-    #     raise ValueError("The initializer token must be a single token.")
-
-    #initializer_token_id = token_ids[0]
+    
     
     placeholder_token_id = tokenizer.convert_tokens_to_ids(placeholder_token_list)
     # Load models and create wrapper for stable diffusion
@@ -394,7 +389,7 @@ def main():
         temp = token_embeds[token_ids[i][:]].mean(axis=0)
         token_embeds[p] = temp
 
-    #before = text_encoder.get_input_embeddings().weight[dog_id].cuda()
+    
     # Freeze vae and unet
     freeze_params(vae.parameters())
     freeze_params(unet.parameters())
@@ -531,17 +526,23 @@ def main():
                     grads = text_encoder.module.get_input_embeddings().weight.grad
                 else:
                     grads = text_encoder.get_input_embeddings().weight.grad
+
                 # Get the index for tokens that we want to zero the grads for
                 idx_all = torch.ones_like(torch.arange(len(tokenizer)))
                 index_grads_to_zero = idx_all.type(torch.bool)
                 
                 for p in placeholder_token_id:
                     index_grads_to_zero[p] = 0
-                #grads[index_grads_to_zero, :] = grads[index_grads_to_zero, :].fill_(0)
                 
-                pre_weights = copy.deepcopy(text_encoder.get_input_embeddings().weight)
-                optimizer.step()
-                text_encoder.get_input_embeddings().weight.data[index_grads_to_zero] = pre_weights[index_grads_to_zero] 
+                if accelerator.num_processes > 1:
+                    pre_weights = copy.deepcopy(text_encoder.module.get_input_embeddings().weight)
+                    optimizer.step()
+                    text_encoder.module.get_input_embeddings().weight.data[index_grads_to_zero] = pre_weights[index_grads_to_zero] 
+                else:
+                    pre_weights = copy.deepcopy(text_encoder.get_input_embeddings().weight)
+                    optimizer.step()
+                    text_encoder.get_input_embeddings().weight.data[index_grads_to_zero] = pre_weights[index_grads_to_zero] 
+                
                 lr_scheduler.step()
                 optimizer.zero_grad()
             
@@ -553,42 +554,37 @@ def main():
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
             
-            
-            # for i in range(768):
-            #     if (before[i].item() != text_encoder.get_input_embeddings().weight[dog_id][i].item()):
-            #         print(before[i].item(), text_encoder.get_input_embeddings().weight[dog_id][i].item())
 
             if global_step >= args.max_train_steps:
                 break
 
         accelerator.wait_for_everyone()
 
-    # Create the pipeline using using the trained modules and save it.
-    if accelerator.is_main_process:
-        pipeline = StableDiffusionPipeline(
-            text_encoder=accelerator.unwrap_model(text_encoder),
-            vae=vae,
-            unet=unet,
-            tokenizer=tokenizer,
-            scheduler=PNDMScheduler(
-                beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
-            ),
-            safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
-            feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
-        )
-        pipeline.save_pretrained(args.output_dir)
-        # Also save the newly trained embeddings
-        #for p in placeholder_token_list :
-        learned_embeds_dict = {}
-        for p in placeholder_token_id:
-            learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[p]
-            learned_embeds_dict[p] =  learned_embeds.detach().cpu()
-        torch.save(learned_embeds_dict, os.path.join(args.output_dir, "learned_embeds.bin"))
-
-        if args.push_to_hub:
-            repo.push_to_hub(
-                args, pipeline, repo, commit_message="End of training", blocking=False, auto_lfs_prune=True
+        # Create the pipeline using the trained modules and save it.
+        if accelerator.is_main_process:
+            pipeline = StableDiffusionPipeline(
+                text_encoder=accelerator.unwrap_model(text_encoder),
+                vae=vae,
+                unet=unet,
+                tokenizer=tokenizer,
+                scheduler=PNDMScheduler(
+                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
+                ),
+                safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
+                feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
             )
+            pipeline.save_pretrained(args.output_dir)
+            
+            learned_embeds_dict = {}
+            for p in placeholder_token_id:
+                learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[p]
+                learned_embeds_dict[p] =  learned_embeds.detach().cpu()
+            torch.save(learned_embeds_dict, os.path.join(args.output_dir, "learned_embeds.bin"))
+
+            if args.push_to_hub:
+                repo.push_to_hub(
+                    args, pipeline, repo, commit_message="End of training", blocking=False, auto_lfs_prune=True
+                )
 
     accelerator.end_training()
 
