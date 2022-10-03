@@ -24,8 +24,8 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
-
-
+import copy
+import json
 logger = get_logger(__name__)
 
 
@@ -46,16 +46,6 @@ def parse_args():
     )
     parser.add_argument(
         "--train_data_dir", type=str, default=None, required=True, help="A folder containing the training data."
-    )
-    parser.add_argument(
-        "--placeholder_token",
-        type=str,
-        default=None,
-        required=True,
-        help="A token to use as a placeholder for the concept.",
-    )
-    parser.add_argument(
-        "--initializer_token", type=str, default=None, required=True, help="A token to use as initializer word."
     )
     parser.add_argument("--learnable_property", type=str, default="object", help="Choose between 'object' and 'style'")
     parser.add_argument("--repeats", type=int, default=100, help="How many times to repeat the training data.")
@@ -235,18 +225,18 @@ class TextualInversionDataset(Dataset):
         interpolation="bicubic",
         flip_p=0.5,
         set="train",
-        placeholder_token="*",
         center_crop=False,
     ):
         self.data_root = data_root
         self.tokenizer = tokenizer
         self.learnable_property = learnable_property
         self.size = size
-        self.placeholder_token = placeholder_token
         self.center_crop = center_crop
         self.flip_p = flip_p
-
-        self.image_paths = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
+        folders = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
+        self.image_paths = []
+        for dir in folders:
+            self.image_paths.extend([os.path.join(dir,file_name) for file_name in os.listdir(dir)])
 
         self.num_images = len(self.image_paths)
         self._length = self.num_images
@@ -269,14 +259,15 @@ class TextualInversionDataset(Dataset):
 
     def __getitem__(self, i):
         example = {}
-        image = Image.open(self.image_paths[i % self.num_images])
+        filename = self.image_paths[i % self.num_images]
+        image = Image.open(filename)
 
         if not image.mode == "RGB":
             image = image.convert("RGB")
 
-        placeholder_string = self.placeholder_token
+        placeholder_string = '<' + filename.split('/')[-2] + "*>"
+        
         text = random.choice(self.templates).format(placeholder_string)
-
         example["input_ids"] = self.tokenizer(
             text,
             padding="max_length",
@@ -325,7 +316,7 @@ def freeze_params(params):
 def main():
     args = parse_args()
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
-
+    mapper = json.load(open('/home/shaunak/imr_class_map.json'))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -361,23 +352,26 @@ def main():
         tokenizer = CLIPTokenizer.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="tokenizer", use_auth_token=args.use_auth_token
         )
-
+    placeholder_token_list = ['<' + f + '*>' for f in os.listdir(args.train_data_dir)]
     # Add the placeholder token in tokenizer
-    num_added_tokens = tokenizer.add_tokens(args.placeholder_token)
-    if num_added_tokens == 0:
+    num_added_tokens = tokenizer.add_tokens(placeholder_token_list)
+    if num_added_tokens != len(placeholder_token_list):
         raise ValueError(
-            f"The tokenizer already contains the token {args.placeholder_token}. Please pass a different"
+            f"The tokenizer already contains the token(s). Please pass a different"
             " `placeholder_token` that is not already in the tokenizer."
         )
 
     # Convert the initializer_token, placeholder_token to ids
-    token_ids = tokenizer.encode(args.initializer_token, add_special_tokens=False)
+    initializer_token_list = [mapper[p[1:-2]] for p in placeholder_token_list]
+    token_ids = [tokenizer.encode(it, add_special_tokens=False) for it in initializer_token_list]
+    #dog_id = 49111 #tokenizer.encode('<n02279972*>', add_special_tokens=False)[0]
     # Check if initializer_token is a single token or a sequence of tokens
-    if len(token_ids) > 1:
-        raise ValueError("The initializer token must be a single token.")
+    # if len(token_ids) > 1:
+    #     raise ValueError("The initializer token must be a single token.")
 
-    initializer_token_id = token_ids[0]
-    placeholder_token_id = tokenizer.convert_tokens_to_ids(args.placeholder_token)
+    #initializer_token_id = token_ids[0]
+    
+    placeholder_token_id = tokenizer.convert_tokens_to_ids(placeholder_token_list)
     # Load models and create wrapper for stable diffusion
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", use_auth_token=args.use_auth_token
@@ -394,7 +388,13 @@ def main():
 
     # Initialise the newly added placeholder token with the embeddings of the initializer token
     token_embeds = text_encoder.get_input_embeddings().weight.data
-    token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
+    assert len(placeholder_token_list) 
+    for i,p in enumerate(placeholder_token_id):
+        
+        temp = token_embeds[token_ids[i][:]].mean(axis=0)
+        token_embeds[p] = temp
+
+    #before = text_encoder.get_input_embeddings().weight[dog_id].cuda()
     # Freeze vae and unet
     freeze_params(vae.parameters())
     freeze_params(unet.parameters())
@@ -405,7 +405,6 @@ def main():
         text_encoder.text_model.embeddings.position_embedding.parameters(),
     )
     freeze_params(params_to_freeze)
-
     if args.scale_lr:
         args.learning_rate = (
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
@@ -429,7 +428,6 @@ def main():
         data_root=args.train_data_dir,
         tokenizer=tokenizer,
         size=args.resolution,
-        placeholder_token=args.placeholder_token,
         repeats=args.repeats,
         learnable_property=args.learnable_property,
         center_crop=args.center_crop,
@@ -499,7 +497,7 @@ def main():
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     global_step = 0
-
+    
     for epoch in range(args.num_train_epochs):
         text_encoder.train()
         for step, batch in enumerate(train_dataloader):
@@ -519,7 +517,7 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0]  #CHECK !!
 
                 # Predict the noise residual
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -534,21 +532,31 @@ def main():
                 else:
                     grads = text_encoder.get_input_embeddings().weight.grad
                 # Get the index for tokens that we want to zero the grads for
-                index_grads_to_zero = torch.arange(len(tokenizer)) != placeholder_token_id
-                grads.data[index_grads_to_zero, :] = grads.data[index_grads_to_zero, :].fill_(0)
-
+                idx_all = torch.ones_like(torch.arange(len(tokenizer)))
+                index_grads_to_zero = idx_all.type(torch.bool)
+                
+                for p in placeholder_token_id:
+                    index_grads_to_zero[p] = 0
+                #grads[index_grads_to_zero, :] = grads[index_grads_to_zero, :].fill_(0)
+                
+                pre_weights = copy.deepcopy(text_encoder.get_input_embeddings().weight)
                 optimizer.step()
+                text_encoder.get_input_embeddings().weight.data[index_grads_to_zero] = pre_weights[index_grads_to_zero] 
                 lr_scheduler.step()
                 optimizer.zero_grad()
-
+            
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+            
+            
+            # for i in range(768):
+            #     if (before[i].item() != text_encoder.get_input_embeddings().weight[dog_id][i].item()):
+            #         print(before[i].item(), text_encoder.get_input_embeddings().weight[dog_id][i].item())
 
             if global_step >= args.max_train_steps:
                 break
@@ -570,8 +578,11 @@ def main():
         )
         pipeline.save_pretrained(args.output_dir)
         # Also save the newly trained embeddings
-        learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[placeholder_token_id]
-        learned_embeds_dict = {args.placeholder_token: learned_embeds.detach().cpu()}
+        #for p in placeholder_token_list :
+        learned_embeds_dict = {}
+        for p in placeholder_token_id:
+            learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[p]
+            learned_embeds_dict[p] =  learned_embeds.detach().cpu()
         torch.save(learned_embeds_dict, os.path.join(args.output_dir, "learned_embeds.bin"))
 
         if args.push_to_hub:
