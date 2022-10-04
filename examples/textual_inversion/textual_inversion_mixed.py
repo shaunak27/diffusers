@@ -55,6 +55,12 @@ def parse_args():
         default="text-inversion-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
+    parser.add_argument(
+        "--mapper_file",
+        type=str,
+        default="imr_class_map.json",
+        help="Imagenet Class mapper file",
+    )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
@@ -316,7 +322,7 @@ def freeze_params(params):
 def main():
     args = parse_args()
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
-    mapper = json.load(open('/home/shaunak/imr_class_map.json'))
+    mapper = json.load(open(args.mapper_file))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
